@@ -1,0 +1,9 @@
+# runtime-данные (историк, шина, станция) — не коммитим
+store/
+*.tampered.eml
+
+# python
+__pycache__/
+*.pyc
+*.log
+.venv/
