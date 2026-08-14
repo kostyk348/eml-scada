@@ -1,0 +1,7 @@
+From: <scada_hmi@system.local>
+To: <ctl_02>
+X-Event: SETPOINT
+X-EMLBox-Msg: v1
+Content-Type: application/json
+
+{"point": "valve_pos", "value": 70.0, "from_hmi": true, "ts": 1786607903.1429353}

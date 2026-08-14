@@ -1,0 +1,9 @@
+X-EMLBox-Record: v1
+X-Record-ID: ctl_03_temp_1786607846034
+X-Tag: temp
+X-Tag: ctl_03
+X-Device-ID: ctl_03
+X-Timestamp: 1786607846
+Content-Type: application/json
+
+{"quality":"good","value":17.9}

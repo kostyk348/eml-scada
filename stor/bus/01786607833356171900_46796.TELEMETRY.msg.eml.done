@@ -1,0 +1,7 @@
+From: <ctl_01@system.local>
+To: <scada_engine>
+X-Event: TELEMETRY
+X-EMLBox-Msg: v1
+Content-Type: application/json
+
+{"cid": "ctl_01", "points": {"temp": 34.6, "pressure": 2.49, "level": 49.2}, "quality": "good", "ts": 1786607833.3557847}

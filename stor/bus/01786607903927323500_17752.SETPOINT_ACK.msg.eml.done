@@ -1,0 +1,7 @@
+From: <ctl_02@system.local>
+To: <scada_hmi@system.local>
+X-Event: SETPOINT_ACK
+X-EMLBox-Msg: v1
+Content-Type: application/json
+
+{"point": "valve_pos", "value": 70.0, "ack": true, "ts": 1786607903.926758}

@@ -140,7 +140,10 @@ def bus_list(bus: Path) -> list[dict]:
         name = p.name
         if name.endswith(DONE_SUFFIX):
             continue
-        headers, body_b = read_eml(p)
+        try:
+            headers, body_b = read_eml(p)
+        except OSError:
+            continue  # файл только что съеден другим потребителем (гонка) — пропуск
         try:
             body = json.loads(body_b.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
