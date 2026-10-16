@@ -1,5 +1,8 @@
 # EML-SCADA v0.1
 
+[![Release](https://img.shields.io/github/v/release/kostyk348/eml-scada?sort=semver&color=blue)](https://github.com/kostyk348/eml-scada/releases)
+[![Last commit](https://img.shields.io/github/last-commit/kostyk348/eml-scada?branch=master)](https://github.com/kostyk348/eml-scada/commits/master)
+
 SCADA-стек на базе [mime-os / EMLBox](https://github.com/kostyk348/mime-os).
 **Всё есть `.eml`**: историк = записи tagdb, станция = один контейнер,
 сообщения контроллеров = MIME на IPC-шине, аларм-лог = дельты с hash-chain.
@@ -13,12 +16,15 @@ HMI (NiceGUI) ──► шина (спулы .eml) ──► движок ──
 
 ```bash
 # headless-проверка (без GUI): 22с опроса, алармы, verify
+
 python -m scada.run --store store --headless --seconds 22
 
 # HMI: http://127.0.0.1:8080
+
 python -m scada.run --store store --port 8080
 
 # tamper-демо: правка дельта-блока в копии станции ловится verify
+
 python verify_demo.py store
 ```
 
