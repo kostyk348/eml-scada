@@ -29,10 +29,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: build emlbox
+      # Пинуем известную рабочую ревизию mime-os: 22f1315 (то, на чём гоняются
+      # тесты). master mime-os на момент релиза не собирается на Linux
+      # (E0716 в src/main.rs), поэтому «просто master» в CI — красный job.
+      # Обновляя пин, прогони: cargo build --release + python -m pytest.
+      - name: clone mime-os (pinned)
         run: |
-          git clone --depth 1 https://github.com/kostyk348/mime-os.git "$RUNNER_TEMP/mime-os"
-          cargo build --release --manifest-path "$RUNNER_TEMP/mime-os/Cargo.toml"
+          git init "$RUNNER_TEMP/mime-os"
+          git -C "$RUNNER_TEMP/mime-os" remote add origin https://github.com/kostyk348/mime-os.git
+          git -C "$RUNNER_TEMP/mime-os" fetch --depth 1 origin 22f131595ce258540a4efe0f4c5308df03e9bbe0
+          git -C "$RUNNER_TEMP/mime-os" checkout --detach FETCH_HEAD
+      - name: build emlbox
+        run: cargo build --release --manifest-path "$RUNNER_TEMP/mime-os/Cargo.toml"
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest
         env:

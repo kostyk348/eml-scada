@@ -227,3 +227,6 @@ Python 3.11+, `nicegui>=2.0`, собранный `emlbox` из
 
 CI (`.github/workflows/ci.yml`): job `unit` — `pytest -m "not integration"`;
 job `integration` — клонирует mime-os, собирает `emlbox`, гоняет весь набор.
+mime-os пинуется на ревизию `22f1315` — на ней тесты зелёные; `master`
+mime-os на момент релиза не собирается на Linux (`E0716`), поэтому
+«просто master» в CI даёт красный job.
