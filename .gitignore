@@ -1,9 +1,19 @@
-# runtime-данные (историк, шина, станция) — не коммитим
+# runtime-данные (историк, спул, контейнеры, архив) — не в репозиторий
 store/
+stor/
 *.tampered.eml
+*.tailcut.eml
 
 # python
 __pycache__/
 *.pyc
 *.log
 .venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# инструменты
+.vscode/
+.idea/

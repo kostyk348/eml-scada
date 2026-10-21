@@ -1,7 +1,0 @@
-From: <scada_engine@system.local>
-To: <scada_hmi>
-X-Event: ALARM
-X-EMLBox-Msg: v1
-Content-Type: application/json
-
-{"ts": 1786607894.1959102, "cid": "ctl_01", "point": "temp", "value": 30.8, "level": "HIGH", "acked": false}

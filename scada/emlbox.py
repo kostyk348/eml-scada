@@ -1,41 +1,81 @@
-"""emlbox.py — обёртка над emlbox CLI + собственная MIME-шина (Python).
+"""emlbox.py — обёртка над CLI emlbox (mime-os) + MIME-шина в Python.
 
-CLI вызывается subprocess-списком (без проблем с кавычками PowerShell).
-Шина дублирует формат src/ipc.rs, но позволяет задать From (CLI зашивает view).
+CLI вызывается списком argv (без проблем с кавычками PowerShell). Шина —
+spool-директория .eml-сообщений (формат src/ipc.rs), но с атомарной публикацией:
+сообщение сначала пишется в `.tmp`, потом `os.replace` — читатель никогда не
+увидит половину сообщения.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
 
+# Путь по умолчанию — рядом собранный mime-os; переопределяется EMLBOX.
 DEFAULT_EMLBOX = Path(r"C:\Users\Lab\Documents\mime-os\target\release\emlbox.exe")
 MSG_SUFFIX = ".msg.eml"
 DONE_SUFFIX = ".done"
+TMP_SUFFIX = ".tmp"
 
 ENGINE_ADDR = "scada_engine"
 HMI_ADDR = "scada_hmi"
 
+_seq = itertools.count(1)
+
+
+class EmlboxMissing(RuntimeError):
+    """Бинарь emlbox не найден — без него контейнеры не работают."""
+
 
 def emlbox_bin() -> str:
-    return os.environ.get("EMLBOX", str(DEFAULT_EMLBOX))
-
-
-def run_cli(args: list[str], timeout: float = 30.0) -> tuple[int, str, str]:
-    """Запуск emlbox. Возвращает (code, stdout, stderr)."""
-    proc = subprocess.run(
-        [emlbox_bin(), *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
+    env = os.environ.get("EMLBOX")
+    if env:
+        return env
+    if DEFAULT_EMLBOX.exists():
+        return str(DEFAULT_EMLBOX)
+    found = shutil.which("emlbox")
+    if found:
+        return found
+    raise EmlboxMissing(
+        "emlbox не найден: собери mime-os (cargo build --release) "
+        f"или задай EMLBOX (искали {DEFAULT_EMLBOX} и PATH)"
     )
+
+
+def check_binary() -> str:
+    """Проверка на старте: лучше упасть сразу, чем на первом сообщении."""
+    path = emlbox_bin()
+    code, out, err = run_cli(["verify", os.devnull], timeout=10.0, check=False)
+    if "unknown command" in (out + err).lower():
+        raise EmlboxMissing(f"{path}: CLI не отвечает как emlbox")
+    return path
+
+
+def run_cli(args: list[str], timeout: float = 30.0, check: bool = False) -> tuple[int, str, str]:
+    """Запуск emlbox. Возвращает (code, stdout, stderr)."""
+    try:
+        proc = subprocess.run(
+            [emlbox_bin(), *args],
+            stdin=subprocess.DEVNULL,   # не наследуем stdin: у сервиса/CI он бывает невалиден
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "", f"emlbox {args[0] if args else ''}: timeout {timeout}s"
+    except FileNotFoundError as e:
+        return 127, "", str(e)
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"emlbox {' '.join(args[:2])} failed: {proc.stderr.strip() or proc.stdout.strip()}")
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
@@ -69,12 +109,13 @@ def kv_get(path: Path, table: str, key: str) -> Any:
 def kv_dump(path: Path, table: str) -> dict:
     code, out, err = run_cli(["kv", "dump", str(path), table])
     if code != 0:
-        print(f"[emlbox] kv dump {table}: {err or out}", file=sys.stderr)
+        # пустая таблица — это не ошибка для вызывающего
         return {}
     try:
-        return json.loads(out)
+        value = json.loads(out)
     except json.JSONDecodeError:
         return {}
+    return value if isinstance(value, dict) else {}
 
 
 # ---------------------------------------------------------------- tagdb
@@ -98,19 +139,26 @@ def tagdb_query(db: Path, query: str) -> list[Path]:
         return []
     hits = []
     for line in out.splitlines():
-        m = re.match(r"\s*(.+\.eml)\s*\(.*\)", line)
+        m = re.match(r"\s*(.+\.eml)\s+\(.*\)\s*$", line)
         if m:
-            hits.append(Path(m.group(1)))
+            p = Path(m.group(1))
+            hits.append(p if p.is_absolute() else db / p.name)
     return hits
 
 
 def read_eml(path: Path) -> tuple[dict[str, str], bytes]:
     """Читает .eml-запись/сообщение: (заголовки, тело)."""
     data = path.read_bytes()
+    return parse_eml(data)
+
+
+def parse_eml(data: bytes) -> tuple[dict[str, str], bytes]:
     sep = b"\r\n\r\n" if b"\r\n\r\n" in data else b"\n\n"
     head_b, _, body_b = data.partition(sep)
     headers: dict[str, str] = {}
     for line in head_b.decode("utf-8", "replace").splitlines():
+        if line[:1] in (" ", "\t") and headers:
+            continue  # folding не нужен для наших сообщений
         if ":" in line:
             k, _, v = line.partition(":")
             headers[k.strip().lower()] = v.strip()
@@ -118,52 +166,103 @@ def read_eml(path: Path) -> tuple[dict[str, str], bytes]:
 
 
 # ---------------------------------------------------------------- IPC-шина
-def bus_send(bus: Path, from_: str, to: str, event: str, body: dict) -> Path:
-    """Пишет .eml-сообщение в spool (формат src/ipc.rs)."""
+def _safe_event(event: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", event)[:40] or "EVENT"
+
+
+def bus_send(bus: Path, from_: str, to: str, event: str, body: dict,
+             ts_ns: int | None = None) -> Path:
+    """Атомарно публикует .eml-сообщение в spool (tmp + replace)."""
+    bus = Path(bus)
     bus.mkdir(parents=True, exist_ok=True)
-    nanos = time.time_ns()
-    safe_ev = re.sub(r"[\s/:]", "_", event)
-    name = f"{nanos:020}_{os.getpid()}.{safe_ev}{MSG_SUFFIX}"
+    nanos = time.time_ns() if ts_ns is None else ts_ns
+    name = f"{nanos:020}_{os.getpid()}_{next(_seq):05d}.{_safe_event(event)}{MSG_SUFFIX}"
     path = bus / name
+    tmp = bus / (name + TMP_SUFFIX)
     buf = (f"From: <{from_}@system.local>\r\nTo: <{to}>\r\nX-Event: {event}\r\n"
            f"X-EMLBox-Msg: v1\r\nContent-Type: application/json\r\n\r\n")
-    path.write_bytes(buf.encode("utf-8") + json.dumps(body).encode("utf-8"))
+    payload = buf.encode("utf-8") + json.dumps(body).encode("utf-8")
+    tmp.write_bytes(payload)
+    os.replace(tmp, path)
     return path
 
 
-def bus_list(bus: Path) -> list[dict]:
-    """Список непрочитанных сообщений: [{path, from, to, event, body}]."""
+def bus_list(bus: Path, address: str | None = None) -> list[dict]:
+    """Список непрочитанных сообщений: [{path, from, to, event, body, ok}].
+
+    address — если задан, фильтруем по To: (свой почтовый ящик). Иначе все.
+    """
     out = []
+    bus = Path(bus)
     if not bus.is_dir():
         return out
     for p in sorted(bus.glob(f"*{MSG_SUFFIX}")):
-        name = p.name
-        if name.endswith(DONE_SUFFIX):
+        if p.name.endswith(DONE_SUFFIX):
             continue
         try:
+            with open(p, "rb") as f:
+                head_chunk = f.read(8192)
+            headers, _ = parse_eml(head_chunk)
+            to = headers.get("to", "").strip().strip("<>")
+            if address is not None and address.split("@")[0] != to.split("@")[0]:
+                continue  # чужая почта: тело даже не читаем
             headers, body_b = read_eml(p)
         except OSError:
             continue  # файл только что съеден другим потребителем (гонка) — пропуск
         try:
             body = json.loads(body_b.decode("utf-8"))
+            ok = isinstance(body, dict)
         except (json.JSONDecodeError, UnicodeDecodeError):
-            body = {}
+            body, ok = {}, False
         out.append({
             "path": p,
-            "from": headers.get("from", "").strip("<>"),
-            "to": headers.get("to", "").strip("<>"),
+            "from": headers.get("from", "").strip().strip("<>"),
+            "to": to,
             "event": headers.get("x-event", ""),
             "body": body,
+            "ok": ok,
+            "size": p.stat().st_size if p.exists() else 0,
         })
     return out
 
 
-def bus_consume(path: Path) -> None:
-    """Потребление сообщения: rename -> .done."""
+def bus_consume(path: Path) -> bool:
+    """Потребление сообщения: rename -> .done. False, если уже съедено."""
+    target = Path(str(path) + DONE_SUFFIX)
     try:
-        path.rename(Path(str(path) + DONE_SUFFIX))
+        os.replace(path, target)
+        return True
     except OSError:
-        pass
+        return False
+
+
+def bus_gc(bus: Path, done_ttl_s: float = 600.0, tmp_ttl_s: float = 60.0,
+           now: float | None = None) -> dict:
+    """Чистка спула: старые .done и осиротевшие .tmp. Возвращает счётчики."""
+    bus = Path(bus)
+    now = time.time() if now is None else now
+    removed = {"done": 0, "tmp": 0, "bytes": 0}
+    if not bus.is_dir():
+        return removed
+    for p in bus.iterdir():
+        try:
+            if p.name.endswith(MSG_SUFFIX + DONE_SUFFIX):
+                ttl = done_ttl_s
+                bucket = "done"
+            elif p.name.endswith(TMP_SUFFIX):
+                ttl = tmp_ttl_s
+                bucket = "tmp"
+            else:
+                continue
+            age = now - p.stat().st_mtime
+            if age >= ttl:
+                size = p.stat().st_size
+                p.unlink()
+                removed[bucket] += 1
+                removed["bytes"] += size
+        except OSError:
+            continue  # гонка с другим потребителем — не наша проблема
+    return removed
 
 
 # ---------------------------------------------------------------- verify
@@ -172,5 +271,4 @@ def verify(path: Path) -> tuple[bool, list[str]]:
     if code == 0:
         return True, [out]
     lines = (out + "\n" + err).splitlines()
-    broken = [l for l in lines if l.strip()]
-    return False, broken
+    return False, [l.strip() for l in lines if l.strip()]

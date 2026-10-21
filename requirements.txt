@@ -1,1 +1,1 @@
-nicegui>=3.0
+nicegui>=2.0

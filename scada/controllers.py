@@ -1,8 +1,12 @@
-"""controllers.py — симуляторы контроллеров (MIME-сущности на IPC-шине).
+"""controllers.py — симуляторы контроллеров (MIME-сущности на шине).
 
-Каждый контроллер: поток, каждую секунду генерит точки (random walk к цели)
-и шлёт TELEMETRY на шину (To: scada_engine). Слушает команды (To: <cid>):
-SETPOINT — меняет цель точки, отвечает ACK отправителю.
+Контроллер живёт в своём потоке: раз в `sim.tick_s` двигает точки (slew к цели
++ шум), отправляет TELEMETRY на `scada_engine` и читает свою почту.
+SETPOINT валидируется по границам точки: подтверждение (SETPOINT_ACK) несёт и
+запрошенное, и применённое значение; на мусор отвечает SETPOINT_REJECT.
+
+Дефекты (всплеск температуры + bad quality) включаются из конфига `sim.*` —
+это же используют тесты, чтобы не ждать 15 тиков.
 """
 from __future__ import annotations
 
@@ -12,101 +16,139 @@ import threading
 import time
 from pathlib import Path
 
-from .emlbox import bus_list, bus_consume, bus_send, ENGINE_ADDR
+from .config import Config
+from .emlbox import ENGINE_ADDR, bus_consume, bus_list, bus_send
 
 log = logging.getLogger("scada.ctl")
 
-# ctl_id -> {point: dict(init, target, min, max, step, noise, unit, digits)}
-CTL_SPECS: dict[str, dict] = {
-    "ctl_01": {
-        "temp":     {"init": 21.0, "target": 21.0, "lo": 0.0, "hi": 60.0, "step": 0.4, "noise": 0.8, "unit": "°C", "digits": 1},
-        "pressure": {"init": 2.5,  "target": 2.5,  "lo": 0.0, "hi": 6.0,  "step": 0.05, "noise": 0.1, "unit": "MPa", "digits": 2},
-        "level":    {"init": 50.0, "target": 50.0, "lo": 0.0, "hi": 100.0, "step": 1.5, "noise": 2.0, "unit": "%", "digits": 1},
-    },
-    "ctl_02": {
-        "temp":      {"init": 24.0, "target": 24.0, "lo": 0.0, "hi": 60.0, "step": 0.4, "noise": 0.8, "unit": "°C", "digits": 1},
-        "valve_pos": {"init": 40.0, "target": 40.0, "lo": 0.0, "hi": 100.0, "step": 4.0, "noise": 1.5, "unit": "%", "digits": 1},
-        "flow":      {"init": 30.0, "target": 30.0, "lo": 0.0, "hi": 100.0, "step": 2.0, "noise": 2.5, "unit": "m³/h", "digits": 1},
-    },
-    "ctl_03": {
-        "temp":  {"init": 18.0, "target": 18.0, "lo": 0.0, "hi": 60.0, "step": 0.4, "noise": 0.8, "unit": "°C", "digits": 1},
-        "level": {"init": 30.0, "target": 30.0, "lo": 0.0, "hi": 100.0, "step": 1.5, "noise": 2.0, "unit": "%", "digits": 1},
-    },
-}
-
-# Периодический «отказ» ctl_01: всплеск temp на +15 на несколько тиков (для демо аларма)
-FAULT_SPIKE_EVERY = 15  # тиков
-FAULT_SPIKE_TICKS = 6
-FAULT_SPIKE_DELTA = 15.0
-
 
 class Controller(threading.Thread):
-    def __init__(self, cid: str, bus: Path, tick_s: float = 1.0, stop: threading.Event | None = None):
+    def __init__(self, cid: str, bus: Path, cfg: Config,
+                 stop: threading.Event | None = None):
         super().__init__(daemon=True, name=f"ctl:{cid}")
         self.cid = cid
         self.bus = Path(bus)
-        self.tick_s = tick_s
+        self.cfg = cfg
+        self.tick_s = float(cfg.get("sim.tick_s"))
         self.stop = stop or threading.Event()
-        self.points: dict[str, dict] = {}
-        for pname, spec in CTL_SPECS[cid].items():
-            self.points[pname] = dict(spec, value=spec["init"])
+
+        specs = cfg.controllers[cid]
+        self.points: dict[str, dict] = {p: dict(spec, value=float(spec["init"]))
+                                        for p, spec in specs.items()}
+        self.targets: dict[str, float] = {}
+        self.last_ack: dict = {}
+        self.rejects = 0
+        self.sent = 0
+
+        sim = cfg.get("sim", {})
+        self.faults_enabled = bool(sim.get("faults_enabled", True)) and sim.get("fault_cid") == cid
+        self.fault_every = int(sim.get("fault_every_ticks", 0))
+        self.fault_ticks = int(sim.get("fault_ticks", 0))
+        self.fault_delta = float(sim.get("fault_delta", 0.0))
+        # bad quality — часть имитации дефектов: только у fault_cid, иначе BADQ
+        # на каждом контроллере каждые N тиков превращается в шум
+        self.badq_every = int(sim.get("badq_every_ticks", 0)) if self.faults_enabled else 0
+
         self._tick_n = 0
         self._fault_active = 0
-        self.targets: dict[str, float] = {}  # переопределённые цели (по SETPOINT)
-        self.last_ack: dict = {}
 
     # ------------------------------------------------------------- симуляция
-    def _step_point(self, pname: str, p: dict) -> None:
-        target = self.targets.get(pname, p["target"])
-        p["value"] += (target - p["value"]) * 0.15 + random.uniform(-p["noise"], p["noise"])
-        p["value"] = max(p["lo"], min(p["hi"], p["value"]))
+    @staticmethod
+    def _clamp(v: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, v))
+
+    def _step_point(self, p: dict) -> None:
+        target = float(p.get("target", p["value"]))
+        slew = (target - p["value"]) * 0.15
+        step = float(p.get("step", abs(slew) or 1.0))
+        slew = self._clamp(slew, -step, step)
+        noise = random.uniform(-float(p["noise"]), float(p["noise"]))
+        p["value"] = self._clamp(p["value"] + slew + noise, float(p["lo"]), float(p["hi"]))
 
     def _apply_fault(self) -> None:
-        # всплеск temp на ctl_01: имитация отказа датчика/процесса
-        if self._fault_active > 0:
-            self._fault_active -= 1
-            p = self.points.get("temp")
-            if p:
-                p["value"] = min(p["hi"], p["value"] + FAULT_SPIKE_DELTA * 0.4)
+        if self._fault_active <= 0:
+            return
+        self._fault_active -= 1
+        p = self.points.get("temp")
+        if p:
+            p["value"] = min(float(p["hi"]), p["value"] + self.fault_delta * 0.4)
 
+    def _quality(self) -> str:
+        if self.badq_every and self._tick_n % self.badq_every == 0:
+            return "bad"
+        return "good"
+
+    # ------------------------------------------------------------- команды
     def _read_commands(self) -> None:
-        for m in bus_list(self.bus):
-            if m["to"] != self.cid:
-                continue  # чужая почта: не трогаем (движок/другие контроллеры)
-            if m["event"] == "SETPOINT":
-                point = m["body"].get("point")
-                value = m["body"].get("value")
-                if point in self.points:
-                    self.targets[point] = float(value)
-                    self.last_ack = {"point": point, "value": float(value), "ack": True, "ts": time.time()}
-                    bus_send(self.bus, self.cid, m["from"], "SETPOINT_ACK", self.last_ack)
-                    log.info("%s: SETPOINT %s -> %.1f", self.cid, point, float(value))
-            bus_consume(m["path"])
+        for m in bus_list(self.bus, address=self.cid):
+            try:
+                if m["event"] == "SETPOINT":
+                    self._on_setpoint(m)
+            finally:
+                bus_consume(m["path"])
 
+    def _on_setpoint(self, m: dict) -> None:
+        body = m["body"]
+        point = body.get("point")
+        try:
+            value = float(body.get("value"))
+        except (TypeError, ValueError):
+            value = None
+        spec = self.points.get(point) if isinstance(point, str) else None
+        reason = None
+        if spec is None:
+            reason = f"unknown point {point!r}"
+        elif value is None:
+            reason = "value is not a number"
+        elif not float(spec["lo"]) <= value <= float(spec["hi"]):
+            reason = f"value {value} out of [{spec['lo']}, {spec['hi']}]"
+
+        if reason is not None:
+            self.rejects += 1
+            bus_send(self.bus, self.cid, m["from"], "SETPOINT_REJECT",
+                     {"point": point, "value": body.get("value"), "reason": reason,
+                      "cid": self.cid, "ts": time.time()})
+            log.warning("%s: SETPOINT отклонён (%s)", self.cid, reason)
+            return
+
+        request = {"from": m["from"], "ts": body.get("ts")}
+        self.targets[point] = value
+        self.points[point]["target"] = value
+        self.last_ack = {"point": point, "value": value, "applied": value,
+                         "ok": True, "cid": self.cid, "request": request,
+                         "ack": True, "ts": time.time()}
+        bus_send(self.bus, self.cid, m["from"], "SETPOINT_ACK", self.last_ack)
+        log.info("%s: SETPOINT %s -> %.3g", self.cid, point, value)
+
+    # ------------------------------------------------------------- телеметрия
     def _emit_telemetry(self) -> None:
-        values = {pname: round(p["value"], p["digits"]) for pname, p in self.points.items()}
-        quality = "bad" if (self._tick_n % 61 == 0 and self.cid == "ctl_01") else "good"
+        values = {pname: round(p["value"], int(p["digits"]))
+                  for pname, p in self.points.items()}
         bus_send(self.bus, self.cid, ENGINE_ADDR, "TELEMETRY",
-                 {"cid": self.cid, "points": values, "quality": quality, "ts": time.time()})
+                 {"cid": self.cid, "points": values,
+                  "quality": self._quality(), "ts": time.time()})
+        self.sent += 1
 
     # ------------------------------------------------------------- поток
     def run(self) -> None:
         while not self.stop.is_set():
             try:
                 self._tick_n += 1
-                if self._tick_n % FAULT_SPIKE_EVERY == 0 and self.cid == "ctl_01":
-                    self._fault_active = FAULT_SPIKE_TICKS
+                if self.faults_enabled and self.fault_every and self._tick_n % self.fault_every == 0:
+                    self._fault_active = self.fault_ticks
                 self._apply_fault()
-                for pname, p in self.points.items():
-                    self._step_point(pname, p)
+                for p in self.points.values():
+                    self._step_point(p)
                 self._read_commands()
                 self._emit_telemetry()
             except Exception as e:  # поток не должен умирать
                 log.warning("%s tick error: %s", self.cid, e)
             self.stop.wait(self.tick_s)
 
-    def setpoint(self, point: str, value: float) -> dict:
-        """Внешний вызов (для HMI-кнопки): вернуть последний ACK."""
-        bus_send(self.bus, ENGINE_ADDR, self.cid, "SETPOINT",
-                 {"point": point, "value": value, "from_hmi": True, "ts": time.time()})
-        return {"sent": point, "value": value}
+    # ------------------------------------------------------------- API
+    def setpoint(self, point: str, value: float, by: str = "hmi") -> dict:
+        """Внешняя отправка (для тестов/скриптов): вернуть, что отправили."""
+        req = {"point": point, "value": value, "from_hmi": True,
+               "by": by, "ts": time.time()}
+        bus_send(self.bus, ENGINE_ADDR, self.cid, "SETPOINT", req)
+        return req

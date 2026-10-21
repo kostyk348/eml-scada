@@ -1,9 +1,0 @@
-X-EMLBox-Record: v1
-X-Record-ID: ctl_02_valve_pos_1786607810841
-X-Tag: valve_pos
-X-Tag: ctl_02
-X-Device-ID: ctl_02
-X-Timestamp: 1786607810
-Content-Type: application/json
-
-{"quality":"good","value":40.7}

@@ -1,9 +1,0 @@
-X-EMLBox-Record: v1
-X-Record-ID: ctl_01_pressure_1786607888138
-X-Tag: pressure
-X-Tag: ctl_01
-X-Device-ID: ctl_01
-X-Timestamp: 1786607888
-Content-Type: application/json
-
-{"quality":"good","value":2.6}

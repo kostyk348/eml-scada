@@ -1,9 +1,0 @@
-X-EMLBox-Record: v1
-X-Record-ID: ctl_02_flow_1786607819228
-X-Tag: flow
-X-Tag: ctl_02
-X-Device-ID: ctl_02
-X-Timestamp: 1786607819
-Content-Type: application/json
-
-{"quality":"good","value":23.1}
