@@ -48,16 +48,34 @@ def _patch_trailer_hash(data: bytearray, new_hash: str) -> None:
     data[-TRAILER_SIZE:] = blob
 
 
+def numeric_delta_indexes(data: bytes, c) -> list[int]:
+    """Индексы дельт, в теле которых есть число в ``value`` (их и можно портить)."""
+    out = []
+    for i, e in enumerate(c.entries):
+        block = bytes(data[e["off"]:e["off"] + e["len"]])
+        if re.search(rb'"value"\s*:\s*(-?\d)', block) is not None:
+            out.append(i)
+    return out
+
+
 def tamper_delta_body(src: Path, dst: Path, which: str = "last") -> dict:
-    """Меняет цифру в теле дельты, не трогая хэши (обычная порча журнала)."""
+    """Меняет цифру в теле дельты, не трогая хэши (обычная порча журнала).
+
+    Дельту выбираем не строго последнюю/первую, а ближайшую в нужную сторону
+    с числом в ``value``: последней записью прогона бывает квитанция или
+    событие без числового значения, и «портить» там нечего.
+    """
     shutil.copy2(src, dst)
     c = parse_container(dst)
-    entry = c.entries[-1] if which == "last" else c.entries[0]
     data = bytearray(dst.read_bytes())
+    indexes = numeric_delta_indexes(bytes(data), c)
+    if not indexes:
+        raise RuntimeError("ни в одной дельте нет числа в value — нечего портить")
+    entry = c.entries[indexes[-1] if which == "last" else indexes[0]]
     block = bytes(data[entry["off"]:entry["off"] + entry["len"]])
     m = re.search(rb'"value"\s*:\s*(-?\d)', block)
-    if not m:
-        raise RuntimeError("в дельте нет числа в value — нечего портить")
+    if m is None:  # индекс найден тем же шаблоном — сюда не попадаем
+        raise RuntimeError("в дельте нет числа в value")
     at = entry["off"] + m.start(1)
     data[at] = ord("7") if data[at] != ord("7") else ord("3")
     dst.write_bytes(bytes(data))
@@ -132,9 +150,14 @@ def run(store: Path, cfg: Config | None = None) -> int:
         print("    ВНИМАНИЕ: обычная порча не поймана")
         ok = False
 
-    # --- 3. согласованная подмена последней дельты (обход emlbox verify)
+    # --- 3. согласованная подмена последней числовой дельты (обход emlbox verify)
     t2 = store / "station_01.tailcut.eml"
-    info2 = tamper_last_delta_consistently(station, t2)
+    st_data = station.read_bytes()
+    idxs = numeric_delta_indexes(st_data, parse_container(station))
+    if not idxs:
+        print("[!] в станции нет числовых дельт — подменять нечего")
+        return 2
+    info2 = tamper_last_delta_consistently(station, t2, delta_index=idxs[-1])
     tool_ok2, tool_lines2 = emlbox.verify(t2)
     deep2 = deep_verify(t2, anchor=anchor)
     print(f"[3] подмена последней дельты seq={info2['delta']} + пересчёт хэшей: "
